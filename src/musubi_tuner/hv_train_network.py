@@ -991,6 +991,11 @@ class NetworkTrainer:
 
         logger.info("")
         logger.info(f"generating sample images at step / サンプル画像生成 ステップ: {steps}")
+        
+        # Debug weight changes before sampling for selective fine-tuning
+        if hasattr(self, 'training_debugger') and self.training_debugger is not None:
+            self.training_debugger.pre_sampling_check()
+        
         if sample_parameters is None:
             logger.error(f"No prompt file / プロンプトファイルがありません: {args.sample_prompts}")
             return
@@ -2053,6 +2058,11 @@ class NetworkTrainer:
                     loss = loss.mean()  # mean loss over all elements in batch
 
                     accelerator.backward(loss)
+                    
+                    # Debug gradient flow for selective fine-tuning
+                    if hasattr(self, 'training_debugger') and self.training_debugger is not None:
+                        self.training_debugger.log_gradient_flow(loss, global_step)
+                    
                     if accelerator.sync_gradients:
                         # self.all_reduce_network(accelerator, network)  # sync DDP grad manually
                         state = accelerate.PartialState()
@@ -2064,6 +2074,10 @@ class NetworkTrainer:
                         if args.max_grad_norm != 0.0:
                             params_to_clip = accelerator.unwrap_model(network).get_trainable_params()
                             accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+
+                    # GRADIENT DEVICE FIX for selective fine-tuning with block swapping
+                    if hasattr(self, "selective_finetuner") and self.selective_finetuner is not None:
+                        self.selective_finetuner.ensure_gradient_device_consistency()
 
                     optimizer.step()
                     lr_scheduler.step()

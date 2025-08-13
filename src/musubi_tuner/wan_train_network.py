@@ -27,6 +27,13 @@ logging.basicConfig(level=logging.INFO)
 
 from musubi_tuner.utils import model_utils
 from musubi_tuner.utils.safetensors_utils import load_safetensors, MemoryEfficientSafeOpen
+from musubi_tuner.utils.selective_finetune import (
+    SelectiveFinetuneManager,
+    SelectiveFinetuneWrapper,
+    is_selective_finetuning_enabled,
+    validate_selective_finetuning_args
+)
+from musubi_tuner.utils.training_debug import add_selective_training_debug
 from musubi_tuner.wan.configs import WAN_CONFIGS
 from musubi_tuner.wan.modules.clip import CLIPModel
 from musubi_tuner.wan.modules.model import WanModel, detect_wan_sd_dtype, load_wan_model
@@ -95,6 +102,23 @@ class WanNetworkTrainer(NetworkTrainer):
             logger.info(f"Converted timestep_boundary to 0 to 1 range: {self.timestep_boundary}")
 
         self.default_guidance_scale = 1.0  # not used
+        
+        # Selective fine-tuning setup
+        self.selective_finetuning_enabled = is_selective_finetuning_enabled(args)
+        if self.selective_finetuning_enabled:
+            validate_selective_finetuning_args(args)
+            logger.info(f"Selective fine-tuning enabled: fraction={args.ff:.6f}, selection_id={args.ffid}")
+            
+            # Validate compatibility with other settings
+            if self.high_low_training:
+                raise ValueError("Selective fine-tuning is not compatible with high-low training (--dit_high_noise)")
+            
+            if args.blocks_to_swap is not None and args.blocks_to_swap > 0:
+                logger.warning("Block swapping is not recommended with selective fine-tuning as the main model stays on CPU")
+        
+        self.selective_finetuner = None
+        self.selective_finetuning_wrapper = None
+        self.training_debugger = None
 
     def process_sample_prompts(
         self,
@@ -466,6 +490,37 @@ class WanNetworkTrainer(NetworkTrainer):
         model = load_wan_model(
             self.config, accelerator.device, dit_path, attn_mode, split_attn, loading_device, dit_weight_dtype, args.fp8_scaled
         )
+        
+        # Set up selective fine-tuning if enabled  
+        if is_selective_finetuning_enabled(args):
+            logger.info("Setting up selective fine-tuning manager...")
+            self.selective_finetuner = SelectiveFinetuneManager(model, args.ff, args.ffid)
+            
+            # Move proxy parameters to GPU device
+            self.selective_finetuner.move_proxy_params_to_device(accelerator.device)
+            
+            # Keep main model on CPU for ultra-low VRAM usage
+            model.to('cpu')
+            
+            # Create wrapper that presents the standard model interface
+            self.selective_finetuning_wrapper = SelectiveFinetuneWrapper(model, self.selective_finetuner)
+            
+            # Log memory usage
+            memory_info = self.selective_finetuner.get_memory_info()
+            logger.info(f"Selective fine-tuning memory usage: "
+                       f"{memory_info['proxy_param_count']:,} proxy parameters, "
+                       f"estimated VRAM: {memory_info['estimated_proxy_memory_mb']:.1f}MB")
+            
+            logger.info("Selective fine-tuning setup complete - wrapper will be used as network")
+            
+            # Setup block swapping compatibility if needed
+            if args.blocks_to_swap is not None and args.blocks_to_swap > 0:
+                self.selective_finetuner.setup_block_swapping_compatibility(args.blocks_to_swap, accelerator.device)
+            
+            # Setup training debugger
+            self.training_debugger = add_selective_training_debug(self.selective_finetuner)
+            logger.info("Training debugger enabled for selective fine-tuning")
+        
         if self.high_low_training:
             # load high noise model
             logger.info(f"Loading high noise model from {self.dit_high_noise_path}")
@@ -676,6 +731,78 @@ class WanNetworkTrainer(NetworkTrainer):
         return model_pred, target
 
     # endregion model specific
+    
+    def train(self, args):
+        """
+        Override train method to handle selective fine-tuning.
+        """
+        # For selective fine-tuning, completely bypass the LoRA/network path
+        if is_selective_finetuning_enabled(args):
+            logger.info("Starting selective fine-tuning training (bypassing LoRA/network modules)...")
+            
+            # Validate selective fine-tuning arguments early
+            validate_selective_finetuning_args(args)
+            
+            # Temporarily set network module to bypass network requirement checks
+            # We'll replace the network creation entirely
+            if not hasattr(args, 'network_module') or args.network_module is None:
+                args.network_module = "musubi_tuner.utils.selective_finetune_dummy"
+                args.network_dim = 1  # Dummy value
+                args.network_alpha = 1.0  # Dummy value
+                
+                # Store that we set these so we can clean up later
+                args._selective_finetuning_added_network_args = True
+            else:
+                args._selective_finetuning_added_network_args = False
+            
+            # Create a dummy module that will return our wrapper
+            self._setup_dummy_network_module()
+            
+            try:
+                # Call parent train method
+                result = super().train(args)
+            finally:
+                # Clean up temporary args if we added them
+                if hasattr(args, '_selective_finetuning_added_network_args') and args._selective_finetuning_added_network_args:
+                    if hasattr(args, 'network_module'):
+                        delattr(args, 'network_module')
+                    if hasattr(args, 'network_dim'):
+                        delattr(args, 'network_dim') 
+                    if hasattr(args, 'network_alpha'):
+                        delattr(args, 'network_alpha')
+                    delattr(args, '_selective_finetuning_added_network_args')
+            
+            return result
+        else:
+            # Regular training
+            return super().train(args)
+    
+    def _setup_dummy_network_module(self):
+        """Create a dummy network module for selective fine-tuning."""
+        import sys
+        import types
+        
+        # Create a dummy module
+        dummy_module = types.ModuleType("musubi_tuner.utils.selective_finetune_dummy")
+        
+        def create_arch_network(*args, **kwargs):
+            """Return the selective fine-tuning wrapper as the network."""
+            logger.info("Returning selective fine-tuning wrapper as network")
+            # The wrapper should have been created in load_transformer by now
+            if hasattr(self, 'selective_finetuning_wrapper'):
+                return self.selective_finetuning_wrapper
+            else:
+                raise RuntimeError("Selective fine-tuning wrapper not found. This should have been created in load_transformer.")
+        
+        def prepare_network(network, args):
+            """Dummy prepare_network that does nothing."""
+            pass
+        
+        dummy_module.create_arch_network = create_arch_network
+        dummy_module.prepare_network = prepare_network
+        
+        # Add to sys.modules so it can be imported
+        sys.modules["musubi_tuner.utils.selective_finetune_dummy"] = dummy_module
 
 
 def wan_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -705,6 +832,20 @@ def wan_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser
         "--offload_inactive_dit",
         action="store_true",
         help="Offload inactive DiT model to CPU. Cannot be used with block swap / アクティブではないDiTモデルをCPUにオフロードします。ブロックスワップと併用できません",
+    )
+
+    # Selective fine-tuning arguments
+    parser.add_argument(
+        "--ff",
+        type=float,
+        default=None,
+        help="Fraction of parameters to train for selective fine-tuning (e.g., 0.00001 for 140k out of 14B params). Enables ultra-low VRAM training. / 選択的ファインチューニングで訓練するパラメータの割合（例：14Bパラメータ中140kの場合は0.00001）。超低VRAMトレーニングを有効にします。",
+    )
+    parser.add_argument(
+        "--ffid",
+        type=int,
+        default=None,
+        help="Deterministic ID for parameter selection in selective fine-tuning. Different IDs select different parameter slices for character-specific training. / 選択的ファインチューニングにおけるパラメータ選択の決定論的ID。異なるIDは異なるパラメータスライスを選択し、キャラクター固有の学習を可能にします。",
     )
 
     return parser
