@@ -1138,63 +1138,210 @@ class SelectiveFinetuneWrapper(nn.Module):
         else:
             logger.info(f"✓ All {total_checked} proxy parameter updates properly applied to model")
             return True
+    
+    def _apply_updates_with_verification(self):
+        """Apply updates with comprehensive verification and logging."""
+        logger.info("Applying proxy parameter updates with verification...")
+        
+        # Step 1: Apply updates using existing method
+        self.apply_updates()
+        
+        # Step 2: Verify each parameter was updated correctly
+        model_params = dict(self.model.named_parameters())
+        successful_updates = 0
+        failed_updates = 0
+        
+        for proxy_name, proxy_param in self.selective_finetuner.proxy_params.items():
+            if proxy_name in self.selective_finetuner.param_metadata:
+                original_name, _, _ = self.selective_finetuner.param_metadata[proxy_name]
+                if original_name in model_params:
+                    model_param = model_params[original_name]
+                    
+                    # Verify the update was applied
+                    proxy_data = proxy_param.data.detach().cpu().float()
+                    model_data = model_param.data.detach().cpu().float()
+                    
+                    if torch.allclose(proxy_data, model_data, rtol=1e-5, atol=1e-6):
+                        successful_updates += 1
+                    else:
+                        failed_updates += 1
+                        logger.warning(f"Update verification failed for {original_name}")
+        
+        logger.info(f"Update verification: {successful_updates} successful, {failed_updates} failed")
+        
+        if failed_updates > 0:
+            logger.warning(f"{failed_updates} parameter updates may not have been applied correctly")
+    
+    def _force_update_application(self):
+        """
+        Force application of proxy parameter updates with enhanced error handling.
+        This is a backup method when standard update application fails.
+        """
+        logger.info("Forcing proxy parameter updates with enhanced verification...")
+        
+        model_params = dict(self.model.named_parameters())
+        force_updated = 0
+        
+        for proxy_name, proxy_param in self.selective_finetuner.proxy_params.items():
+            if proxy_name not in self.selective_finetuner.param_metadata:
+                continue
+                
+            original_name, expected_shape, expected_dtype = self.selective_finetuner.param_metadata[proxy_name]
+            
+            if original_name not in model_params:
+                logger.warning(f"Cannot force update {original_name} - parameter not found in model")
+                continue
+                
+            original_param = model_params[original_name]
+            
+            # Validate shapes match
+            if proxy_param.shape != expected_shape or proxy_param.shape != original_param.shape:
+                logger.error(f"Shape mismatch preventing update for {original_name}: "
+                           f"proxy={proxy_param.shape}, expected={expected_shape}, model={original_param.shape}")
+                continue
+            
+            # Force the update with comprehensive device and dtype handling
+            try:
+                with torch.no_grad():
+                    # Ensure proxy data is moved to correct device/dtype
+                    updated_data = proxy_param.data.to(
+                        device=original_param.device,
+                        dtype=original_param.dtype
+                    )
+                    
+                    # Force copy the data
+                    original_param.data.copy_(updated_data)
+                    
+                    # Verify the copy worked
+                    if torch.allclose(original_param.data.cpu().float(), proxy_param.data.cpu().float(), rtol=1e-5, atol=1e-6):
+                        force_updated += 1
+                        logger.debug(f"Force updated {original_name} successfully")
+                    else:
+                        logger.error(f"Force update failed for {original_name} - data did not copy correctly")
+                        
+            except Exception as e:
+                logger.error(f"Exception during force update of {original_name}: {e}")
+        
+        logger.info(f"Force update completed: {force_updated} parameters updated")
+    
+    def _verify_state_dict_contains_updates(self, state_dict: Dict[str, torch.Tensor]) -> bool:
+        """
+        Verify that the state dict contains the trained values from proxy parameters.
+        This is the final check before saving to ensure we're not saving untrained weights.
+        """
+        logger.info("Verifying state dict contains trained parameter values...")
+        
+        verified_count = 0
+        mismatch_count = 0
+        
+        for proxy_name, proxy_param in self.selective_finetuner.proxy_params.items():
+            if proxy_name not in self.selective_finetuner.param_metadata:
+                continue
+                
+            original_name, _, _ = self.selective_finetuner.param_metadata[proxy_name]
+            
+            if original_name not in state_dict:
+                logger.warning(f"Parameter {original_name} not found in state dict")
+                continue
+            
+            state_dict_param = state_dict[original_name]
+            
+            # Compare proxy parameter with state dict parameter
+            proxy_data_cpu = proxy_param.data.detach().cpu().float()
+            state_dict_data_cpu = state_dict_param.detach().cpu().float()
+            
+            if torch.allclose(proxy_data_cpu, state_dict_data_cpu, rtol=1e-5, atol=1e-6):
+                verified_count += 1
+            else:
+                mismatch_count += 1
+                mean_diff = (proxy_data_cpu - state_dict_data_cpu).abs().mean().item()
+                logger.warning(f"State dict verification FAILED for {original_name}: mean_diff={mean_diff:.8f}")
+                
+                if mismatch_count <= 3:  # Log details for first few failures
+                    max_diff = (proxy_data_cpu - state_dict_data_cpu).abs().max().item()
+                    logger.warning(f"  Details: proxy_mean={proxy_data_cpu.mean():.6f}, "
+                                 f"state_dict_mean={state_dict_data_cpu.mean():.6f}, "
+                                 f"max_diff={max_diff:.8f}")
+        
+        logger.info(f"State dict verification: {verified_count} verified, {mismatch_count} mismatched")
+        
+        if mismatch_count > 0:
+            logger.error(f"CRITICAL: {mismatch_count} parameters in state dict do not match trained proxy values!")
+            logger.error("This means the saved model will NOT contain the trained weights!")
+            return False
+        else:
+            logger.info(f"✓ All {verified_count} trained parameters verified in state dict")
+            return True
         
     def save_weights(self, filepath: str, dtype: Optional[torch.dtype] = None, metadata: Optional[Dict] = None):
         """
-        Enhanced save_weights with complete proxy update application and validation.
+        Enhanced save_weights with robust proxy update application and comprehensive validation.
+        Ensures trained proxy parameters are permanently merged into the saved model.
         """
-        logger.info("Applying proxy parameter updates for model saving...")
-        
-        # SAFETY: Store original proxy parameter devices for restoration
-        original_devices = {}
-        for proxy_name, proxy_param in self.selective_finetuner.proxy_params.items():
-            original_devices[proxy_name] = proxy_param.device
+        logger.info("=== SAVING MODEL WITH SELECTIVE FINE-TUNING ===")
+        logger.info("Applying proxy parameter updates for permanent model saving...")
         
         try:
-            # Apply updates using existing method (preserves working logic)
-            self.apply_updates()
+            # STEP 1: Force comprehensive update application
+            logger.info("Step 1: Applying proxy parameter updates to main model...")
+            self._apply_updates_with_verification()
             
-            # VALIDATION: Verify updates were applied correctly
+            # STEP 2: Comprehensive validation
+            logger.info("Step 2: Validating all updates were applied correctly...")
             updates_valid = self._validate_updates_applied()
             if not updates_valid:
-                logger.warning("Some proxy updates may not have been applied correctly, but proceeding with save...")
+                logger.error("CRITICAL: Some proxy updates were not applied correctly!")
+                # Try applying updates again with extra verification
+                logger.info("Attempting secondary update application...")
+                self._force_update_application()
+                updates_valid = self._validate_updates_applied()
+                
+                if not updates_valid:
+                    raise RuntimeError("Failed to apply proxy parameter updates to model - cannot save correctly trained model")
             
-            # Get state dict (should now have all updates applied)
+            # STEP 3: Additional state dict verification
+            logger.info("Step 3: Performing final state dict verification...")
             state_dict = self.model.state_dict()
+            final_verification = self._verify_state_dict_contains_updates(state_dict)
             
-            # Convert dtype if specified
+            if not final_verification:
+                logger.error("CRITICAL: State dict does not contain expected trained values!")
+                raise RuntimeError("State dict verification failed - trained values not found in model")
+            
+            # STEP 4: Convert dtype if specified
             if dtype is not None:
+                logger.info(f"Step 4: Converting state dict to dtype {dtype}...")
                 for key in state_dict:
                     if state_dict[key].dtype.is_floating_point:
                         state_dict[key] = state_dict[key].to(dtype)
             
-            # Save using safetensors if filepath ends with .safetensors
+            # STEP 5: Save the model
+            logger.info(f"Step 5: Saving model to {filepath}...")
             if filepath.endswith('.safetensors'):
                 from safetensors.torch import save_file
                 
                 if metadata is None:
                     metadata = {}
                 
-                # Add selective fine-tuning metadata
+                # Add selective fine-tuning metadata (simplified as requested)
                 metadata.update({
-                    'selective_finetune_fraction': str(self.selective_finetuner.fraction),
-                    'selective_finetune_selection_id': str(self.selective_finetuner.selection_id),
-                    'selective_finetune_proxy_params': str(len(self.selective_finetuner.proxy_params)),
-                    'selective_finetune_updates_validated': str(updates_valid)
+                    'selective_finetune_applied': 'true',
+                    'trained_params': str(len(self.selective_finetuner.proxy_params))
                 })
                 
                 save_file(state_dict, filepath, metadata)
             else:
                 torch.save(state_dict, filepath)
             
-            logger.info(f"Saved selective fine-tuned model to: {filepath}")
+            logger.info(f"✓ Successfully saved selective fine-tuned model to: {filepath}")
+            logger.info(f"✓ Model contains {len(self.selective_finetuner.proxy_params)} trained parameters")
+            logger.info(f"✓ Saved model should work perfectly with standard inference scripts")
+            logger.info("=== SAVE COMPLETE ===")
             
         except Exception as e:
             logger.error(f"Error during selective fine-tuning model save: {e}")
+            logger.error("This may result in saved models that don't match training quality!")
             raise
-        
-        # Note: We don't restore original devices here because the proxy parameters
-        # should remain where they are for continued training
     
     @property
     def dtype(self):
