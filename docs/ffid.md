@@ -1,162 +1,116 @@
-# FFID: Selective Full Finetuning for Large Models
+# Full finetuning on deterministic parameter slices that are spread across evenly among blocks
 
-## Overview
+## Control args
 
-FFID implements selective full finetuning by training deterministic parameter slices distributed evenly across ALL model parameters. This approach enables training 14B parameter models with minimal VRAM requirements while maintaining full finetuning effectiveness across the entire model architecture.
+`--ff 0.0001` (how much params)
+`--ffid 1` (where)
 
-## Implementation
+This allows full-finetuning to a targeted parameter space in the model, baking, without overwriting knowledge of other slices.
 
-### Core Concept
+## Notes
 
-- **Even Parameter Distribution**: Deterministically select elements from EVERY parameter in the model proportionally
-- **Complete Model Coverage**: All 1,095 parameters get trained (embedding layers + all 40 transformer blocks)
-- **Proxy Parameters**: Create small trainable vectors containing only the selected parameter values
-- **Gradient Flow**: Enable gradients on selected original parameters, sync to proxy parameters for optimization
-- **Parameter Sync**: Apply trained proxy values back to original model parameters
+*   **Note:** Only tested for Wan 2.2 (trained the low_noise weights)
+*   **Note2:** Doesnt work with bnb's adamw8bit, will result in an error:
+    ```
+    File "\site-packages\bitsandbytes\optim\optimizer.py", line 500, in update_step
+    p.grad = p.grad.contiguous()
+    ^^^^^^
+    RuntimeError: attempting to assign a gradient with device type 'cuda' to a tensor with device type 'cpu'. Please
+    ensure that the gradient and the tensor are on the same device
+    ```
+*   **Note3:** Tried to keep main repo file changes minimal, implemented core logic to: `utils\selective_finetune.py` and debugging file (there was a lot of need for it for end to end gradient flow debugging): `utils\training_debug`
+*   **Note4:** Working with `--blocks_to_swap`, `--mixed_precision`, `--gradient_checkpointing` args
+*   **Note5:** Code was written by Claude Code
 
-### Technical Flow
+---
 
-```
-1. Model Loading (CPU, gradients disabled)
-2. Even Parameter Distribution (select from ALL 1,095 parameters proportionally)
-3. Proxy Parameter Creation (small tensors with selected values)
-4. Gradient Connection Setup (enable gradients on selected original parameters)
-5. Training Loop:
-   - Forward pass → Loss → Backward pass
-   - Gradient sync: Original parameters → Proxy parameters
-   - Optimizer step on proxy parameters only
-   - Parameter sync: Proxy parameters → Original parameters
-```
+## Results:
 
-## Usage
-
-### Basic Command
-
-```bash
---ff 0.00001 --ffid 1
-```
-
-### Parameters
-
-- `--ff`: Fraction of total parameters to train (e.g., 0.00001 = 0.001% of 14B = ~140k parameters)
-- `--ffid`: Deterministic selection pattern (1-based indexing, creates different parameter selections)
-
-### Parameter Calculation
-
-For a 14B parameter model with `--ff 0.00001`:
-- Target elements: ~140k total (distributed across all parameters)
-- Coverage: 100% of parameters (all 1,095 parameters get some elements selected)
-- Valid `--ffid` range: 1+ (different deterministic patterns)
-
-## Memory Characteristics
-
-### Observed Memory Usage (14B Model)
-
-| Component | Memory Usage |
-|-----------|--------------|
-| Base Model (CPU) | 27.9 GB RAM |
-| Proxy Parameters (140k) | 0.01 GB RAM |
-| Training VRAM | <6 GB |
-| Full Model VRAM (comparison) | ~53 GB |
-
-### Memory Efficiency
-
-- **RAM overhead**: ~0.04% increase for proxy parameters
-- **VRAM savings**: 99.99% reduction vs full finetuning
-- **Training speed**: ~5-6 seconds/iteration maintained
-
-## Training Evidence
-
-### Gradient Flow Verification
-
-Observed gradient norms with `--ff 0.00001`:
-- Total gradient norm: 0.21 (across all selected parameters)
-- Individual parameter gradients distributed across all layers  
-- Parameter sync values: 0.18 → 1.35 (increasing over steps)
-
-### Parameter Updates
-
-Training progression shows increasing parameter changes:
-- Step 5: 0.18 total parameter sync
-- Step 10: 0.68 total parameter sync
-- Step 25: 1.35 total parameter sync
-- Individual parameter max changes: 0.00007 - 0.00048 per step
-
-## Parameter Distribution Pattern
-
-With `--ff 0.00001`, even distribution across all components:
-
-### Non-Block Parameters
-- `patch_embedding.*` - Visual patch processing
-- `text_embedding.*` - Text processing layers  
-- `time_embedding.*` - Temporal processing
-- `time_projection.*` - Time projection layers
-- `head.*` - Output layers
-
-### Transformer Blocks (All 40 Blocks Covered)
-- **Character Blocks (0-19)**: Control character appearance and features
-  - `blocks.0.* through blocks.19.*` - Self/cross attention + FFN layers
-- **Style Blocks (20-39)**: Control artistic style and rendering
-  - `blocks.20.* through blocks.39.*` - Self/cross attention + FFN layers
-
-### Complete Coverage Verification
+### Baseline DiT sample for prompt character1
 
 ```
-Coverage: 1095/1095 parameters (100.0%)
-More imporant blocks for character looks: early blocks 0-19
-Rather for style and other blocks: later blocks 20-39
+python wan_generate_video.py --task t2v-14B --video_length 1 --infer_steps 30 --prompt "character1 sitting in a modern restaurant at night, wearing elegant dress" --save_path C:/train/saves/test/ --output_type both --dit "C:/train/ckpts/wan22_t2v_14B_low_noise_bf16.safetensors" --vae C:/train/ckpts/wan_2.1_vae.safetensors --t5 C:/train/ckpts/models_t5_umt5-xxl-enc-bf16.pth --attn_mode sdpa --seed 1234 --blocks_to_swap 24 --video_size 720 1280 --flow_shift 12 --seed 1234 --infer_steps 30 --video_length 1 --guidance_scale 3
 ```
 
-## Character Training Workflow
+**Sample:**
 
-### Multi-Character Training
+### Trained character1 with --ff 0.001 --ffid 1 for x epochs
 
-1. Train character A: `--ff 0.00001 --ffid 1`
-2. Train character B: `--ff 0.00001 --ffid 2`  
-3. Train character C: `--ff 0.00001 --ffid 3`
-
-Each `--ffid` creates different deterministic selection patterns within each parameter, ensuring non-interference between character training sessions.
-
-### Model Saving
-
-The save process applies final proxy parameter updates to the full model:
-```python
-apply_proxy_updates_to_model()  # Sync trained values
-save_full_model()              # Standard safetensors format
+**Full training command:**
+```
+accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 wan_train_network.py --task t2v-A14B --dit C:/train/ckpts/wan22_t2v_14B_low_noise_bf16.safetensors --dataset_config C:/train/hunyuan_dataset.toml --sdpa --mixed_precision bf16 --optimizer_type adamW --learning_rate 1e-4 --gradient_checkpointing --max_data_loader_n_workers 2 --persistent_data_loader_workers --timestep_sampling shift --discrete_flow_shift 3.0 --max_train_epochs 1000 --save_every_n_epochs 10 --save_state --seed 1234 --output_dir C:/train/saves --output_name character1_512 --vae C:/train/ckpts/wan_2.1_vae.safetensors --t5 C:/train/ckpts/models_t5_umt5-xxl-enc-bf16.pth --sample_prompts "C:/train/sample/random_prompt.txt" --sample_every_n_epochs 5 --logging_dir "C:/train/logs" --lr_warmup_steps "50" --lr_scheduler "linear" --preserve_distribution_shape --min_timestep "0" --max_timestep "1000" --preserve_distribution_shape --ff 0.001 --ffid 1 --blocks_to_swap 24
 ```
 
-## Compatibility
+### character1.safetensors sample for prompt character1:
 
-- **Model Format**: Standard safetensors files
-- **Training Resume**: Full compatibility with existing training infrastructure
-- **Inference**: No modifications required, trained parameters integrated into model
-- **Block Swapping**: Compatible with memory optimization techniques
-
-## Key Advantages
-
-- **Complete Architecture Coverage**: Every layer contributes to training (not just early parameters)
-- **Character + Style Control**: Both appearance (blocks 0-19) and style (blocks 20-39) layers trained
-- **Deterministic Reproducibility**: Same `--ff` and `--ffid` always select identical elements
-- **Non-Interference**: Different characters train different parameter patterns
-- **Memory Efficient**: 99.95% VRAM reduction while training entire model architecture
-
-## Verification
-
-System integrity confirmed through:
-- Even distribution: All 1,095 parameters receive proportional element selection
-- Gradient flow: Model parameters → Proxy parameters (manual sync)
-- Parameter sync: Proxy parameters → Model parameters (after optimizer steps)
-- Block coverage: Verification that all transformer blocks 0-39 participate in training
-- Memory debugging: Consistent RAM usage patterns
-
-## Default Recommendation
-
-```bash
---ff 0.00001 --ffid 1
+```
+python wan_generate_video.py --task t2v-14B --video_length 1 --infer_steps 30 --prompt "character1 sitting in a modern restaurant at night, wearing elegant dress" --save_path C:/train/saves/test/ --output_type both --dit "C:/train/saves/character1_512-000010.safetensors" --vae C:/train/saves/wan_2.1_vae.safetensors --t5 C:/train/ckpts/models_t5_umt5-xxl-enc-bf16.pth --attn_mode sdpa --seed 1234 --blocks_to_swap 24 --video_size 720 1280 --flow_shift 12 --seed 1234 --infer_steps 30 --video_length 1 --guidance_scale 3
 ```
 
-This configuration provides:
-- 140k trainable parameters (0.001% of 14B model) distributed across ALL model components
-- Complete coverage: All embedding layers + all 40 transformer blocks
-- Character control: Early blocks for appearance, later blocks for style
-- Minimal memory overhead (<6GB VRAM) with complete model architecture training
+**Sample:**
+
+### Trained character2 with --ff 0.001 --ffid 2 for x epochs with "character1.safetensors" as baseline
+
+**Full training command:**
+```
+accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 wan_train_network.py --task t2v-A14B --dit C:/train/saves/character1_512-000010.safetensors --dataset_config C:/train/hunyuan_dataset.toml --sdpa --mixed_precision bf16 --optimizer_type adamW --learning_rate 1e-4 --gradient_checkpointing --max_data_loader_n_workers 2 --persistent_data_loader_workers --timestep_sampling shift --discrete_flow_shift 3.0 --max_train_epochs 1000 --save_every_n_epochs 10 --save_state --seed 1234 --output_dir C:/train/saves --output_name character1_512 --vae C:/train/ckpts/wan_2.1_vae.safetensors --t5 C:/train/ckpts/models_t5_umt5-xxl-enc-bf16.pth --sample_prompts "C:/train/sample/random_prompt.txt" --sample_every_n_epochs 5 --logging_dir "C:/train/logs" --lr_warmup_steps "50" --lr_scheduler "linear" --preserve_distribution_shape --min_timestep "0" --max_timestep "1000" --preserve_distribution_shape --ff 0.001 --ffid 2 --blocks_to_swap 24
+```
+
+### character1_2.safetensors sample for prompt character2:
+
+```
+python wan_generate_video.py --task t2v-14B --video_length 1 --infer_steps 30 --prompt "character2 sitting in a modern restaurant at night, wearing elegant dress" --save_path C:/train/saves/test/ --output_type both --dit "C:/train/saves/character2_512-000010.safetensors" --vae C:/train/saves/wan_2.1_vae.safetensors --t5 C:/train/ckpts/models_t5_umt5-xxl-enc-bf16.pth --attn_mode sdpa --seed 1234 --blocks_to_swap 24 --video_size 720 1280 --flow_shift 12 --seed 1234 --infer_steps 30 --video_length 1 --guidance_scale 3
+```
+
+**Sample:**
+
+### character1_2.safetensors sample for prompt character1, to verify knowledge of her is also intact:
+
+```
+python wan_generate_video.py --task t2v-14B --video_length 1 --infer_steps 30 --prompt "character1 sitting in a modern restaurant at night, wearing elegant dress" --save_path C:/train/saves/test/ --output_type both --dit "C:/train/saves/character2_512-000010.safetensors" --vae C:/train/saves/wan_2.1_vae.safetensors --t5 C:/train/ckpts/models_t5_umt5-xxl-enc-bf16.pth --attn_mode sdpa --seed 1234 --blocks_to_swap 24 --video_size 720 1280 --flow_shift 12 --seed 1234 --infer_steps 30 --video_length 1 --guidance_scale 3
+```
+
+**Sample:**
+
+---
+
+## Vram usage during training with --ff 0.001 --blocks_to_swap 24:
+
+**Resources:**
+
+![vram](https://github.com/user-attachments/assets/0f13884a-6dbd-499b-9b58-b89a3bed8eaf)
+
+
+## Convergence in tensorboard --ff 0.001 (blue) vs 0.0001 (orange):
+
+**Tensorboard:**
+
+![tensorboard](https://github.com/user-attachments/assets/80b5fa78-cc1f-4199-8c70-edbb70e41dff)
+
+
+---
+
+### Scaling Options (~14.9B Model, Full `bfloat16` Precision)
+
+The `--ff` argument controls how many parameters are trained on the GPU. The full **27.8 GB model remains in CPU RAM**. The VRAM estimates below assume **all GPU tensors (parameters, gradients, and optimizer states) are in `bfloat16`**, plus a base overhead of ~1.5 GB.
+
+| `--ff` Value | Trainable Parameters | % of Model | Est. GPU VRAM | Use Case                               |
+| :----------- | :------------------- | :--------- | :------------ | :------------------------------------- |
+| `0.00001`    | ~149k                | 0.001%     | **~1.5 GB**   | Very simple concept/object             |
+| `0.0001`     | ~1.49M               | 0.01%      | **~1.6 GB**   | Simple characters                      |
+| `0.0005`     | ~7.45M               | 0.05%      | **~1.7 GB**   | More complex characters/styles         |
+| `0.001`      | ~14.9M               | 0.1%       | **~1.8 GB**   | Multiple concepts, more detailed style - Used in my tests |
+| `1.0`        | ~14.9B               | 100%       | **~115+ GB**  | Full fine-tuning (does not use this script's memory-saving features) |
+
+### Calculation Breakdown:
+
+*   **Low `ff` Values (`ff=0.001`):**
+    *   **Base Cost:** ~1.5 GB (CUDA context, activations, etc.)
+    *   **Trainable Params:** `14.9M params * 8 bytes/param (all bf16) ≈ 119 MB`.
+    *   **Total:** `1.5 GB + 119 MB ≈ 1.62 GB`. The **~1.8 GB** estimate provides a safe buffer.
+
+*   **Full Fine-tuning (`ff=1.0`) with full `bf16`:**
+    *   **Model:** 27.8 GB (`bfloat16`)
+    *   **Gradients:** 27.8 GB (`bfloat16`)
+    *   **Optimizer States:** `14.9B params * 4 bytes/param (2x bf16) ≈ 59.6 GB`.
+    *   **Total:** `27.8 + 27.8 + 59.6 ≈ 115.2 GB`. The **~115+ GB** estimation for this scenario.
