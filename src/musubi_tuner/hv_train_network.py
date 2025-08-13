@@ -2077,7 +2077,60 @@ class NetworkTrainer:
 
                     # GRADIENT DEVICE FIX for selective fine-tuning with block swapping
                     if hasattr(self, "selective_finetuner") and self.selective_finetuner is not None:
-                        self.selective_finetuner.ensure_gradient_device_consistency()
+                        # Extra aggressive checking if we just resumed (reduced spam)
+                        if hasattr(self, "_selective_ft_resume_device_check") and self._selective_ft_resume_device_check and global_step < 5:
+                            if global_step == 0:  # Only log on first step
+                                logger.info(f"Post-resume device validation at step {global_step}...")
+                            
+                            # Check all parameters and their gradients
+                            trainable_params = self.selective_finetuner.get_trainable_parameters()
+                            device_issues = []
+                            for i, param in enumerate(trainable_params[:10]):  # Check first 10
+                                if param.grad is not None:
+                                    if param.device != param.grad.device:
+                                        device_issues.append(f"Param {i}: param={param.device}, grad={param.grad.device}")
+                            
+                            if device_issues and global_step == 0:  # Only warn on first step
+                                logger.warning(f"Found {len(device_issues)} device mismatches at step {global_step}:")
+                                for issue in device_issues[:3]:
+                                    logger.warning(f"  {issue}")
+                            
+                            # Turn off aggressive checking after step 3 (earlier)
+                            if global_step >= 3:
+                                self._selective_ft_resume_device_check = False
+                                logger.info("Resume device validation complete - training should be stable now")
+                        
+                        # CRITICAL: Fix optimizer state device issues on first step after resume
+                        if hasattr(self, "_selective_ft_optimizer_device_fix_needed") and self._selective_ft_optimizer_device_fix_needed:
+                            logger.info("FIXING OPTIMIZER STATE DEVICE CONSISTENCY after resume...")
+                            
+                            # Get the actual optimizer (unwrap from accelerator)
+                            actual_optimizer = optimizer.optimizer if hasattr(optimizer, 'optimizer') else optimizer
+                            
+                            # Fix optimizer state device consistency
+                            trainable_params = self.selective_finetuner.get_trainable_parameters()
+                            fixed_optimizer_states = 0
+                            
+                            for param in trainable_params:
+                                if param in actual_optimizer.state:
+                                    state = actual_optimizer.state[param]
+                                    for key, value in state.items():
+                                        if isinstance(value, torch.Tensor) and value.device != param.device:
+                                            logger.debug(f"Moving optimizer state '{key}' from {value.device} to {param.device}")
+                                            state[key] = value.to(param.device)
+                                            fixed_optimizer_states += 1
+                            
+                            if fixed_optimizer_states > 0:
+                                logger.info(f"Fixed {fixed_optimizer_states} optimizer state tensors to match parameter devices")
+                            else:
+                                logger.info("Optimizer state devices already consistent with parameters")
+                            
+                            # Only do this once
+                            self._selective_ft_optimizer_device_fix_needed = False
+                        
+                        fixed_grads = self.selective_finetuner.ensure_gradient_device_consistency()
+                        if fixed_grads > 0:
+                            logger.debug(f"Fixed {fixed_grads} gradient device mismatches before optimizer step")
 
                     optimizer.step()
                     lr_scheduler.step()

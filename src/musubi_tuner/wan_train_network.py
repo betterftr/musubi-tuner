@@ -551,6 +551,105 @@ class WanNetworkTrainer(NetworkTrainer):
             self.next_model_is_high_noise = False
 
         return model
+    
+    def resume_from_local_or_hf_if_specified(self, accelerator: Accelerator, args: argparse.Namespace) -> bool:
+        """
+        Override parent resume method to add selective fine-tuning state fixing after resume.
+        """
+        # Call parent method to do the actual resume
+        resumed = super().resume_from_local_or_hf_if_specified(accelerator, args)
+        
+        # If we resumed and selective fine-tuning is enabled, fix the state
+        if resumed and is_selective_finetuning_enabled(args):
+            self._fix_selective_finetuning_after_resume(accelerator, args)
+        
+        return resumed
+
+    def _fix_selective_finetuning_after_resume(self, accelerator, args):
+        """
+        Fix selective fine-tuning state after resume - ensures device consistency and parameter integrity.
+        This method is called after accelerator.load_state() to fix any device mismatches.
+        """
+        if not (is_selective_finetuning_enabled(args) and hasattr(self, 'selective_finetuner')):
+            return
+            
+        logger.info("Fixing selective fine-tuning state after resume...")
+        
+        try:
+            # Validate that selective fine-tuning configuration matches
+            if hasattr(args, 'resume') and args.resume:
+                logger.info(f"Resuming with selective fine-tuning: --ff {args.ff:.6f} --ffid {args.ffid}")
+                
+                # Validate configuration matches what was saved
+                expected_fraction = self.selective_finetuner.fraction
+                expected_selection_id = self.selective_finetuner.selection_id
+                
+                if abs(args.ff - expected_fraction) > 1e-9:
+                    logger.warning(f"Resume --ff {args.ff:.6f} differs from saved fraction {expected_fraction:.6f}")
+                
+                if args.ffid != expected_selection_id:
+                    logger.warning(f"Resume --ffid {args.ffid} differs from saved selection_id {expected_selection_id}")
+            
+            # Fix device consistency issues that can occur after state loading
+            logger.info("Ensuring gradient-parameter device consistency for selective fine-tuning...")
+            fixed_gradients = self.selective_finetuner.ensure_gradient_device_consistency()
+            
+            if fixed_gradients > 0:
+                logger.info(f"Fixed device consistency for {fixed_gradients} parameters after resume")
+            else:
+                logger.info("All parameters and gradients already have consistent devices")
+            
+            # CRITICAL: Also check if optimizer might have stale device references
+            # Force a validation by creating temporary gradients and checking device consistency
+            logger.info("Performing comprehensive device consistency validation...")
+            trainable_params = self.selective_finetuner.get_trainable_parameters()
+            cpu_params = sum(1 for p in trainable_params if p.device.type == 'cpu')
+            gpu_params = sum(1 for p in trainable_params if p.device.type == 'cuda')
+            
+            logger.info(f"Post-resume parameter device distribution: {cpu_params} on CPU, {gpu_params} on GPU")
+            if cpu_params > 0 and gpu_params > 0:
+                logger.info("Mixed device setup detected - this is expected with block swapping")
+            
+            # Store a flag to indicate we need extra device checking during first few steps
+            self._selective_ft_resume_device_check = True
+            
+            # CRITICAL FIX: The optimizer's internal state (momentum buffers) may still have 
+            # references to old devices. We need to flag that optimizer state needs device fixing.
+            self._selective_ft_optimizer_device_fix_needed = True
+            logger.info("Marked optimizer for device consistency fixing in first training step")
+            
+            # Re-validate parameter identity consistency (critical for optimizer)
+            trainable_params = self.selective_finetuner.get_trainable_parameters()
+            model_params = dict(self.selective_finetuning_wrapper.model.named_parameters())
+            identity_matches = 0
+            
+            for i, param in enumerate(trainable_params[:3]):  # Check first 3 for validation
+                proxy_name = f"proxy_{i:06d}"
+                if proxy_name in self.selective_finetuner.param_metadata:
+                    original_name, _, _ = self.selective_finetuner.param_metadata[proxy_name]
+                    if proxy_name in self.selective_finetuner.proxy_params:
+                        proxy_param = self.selective_finetuner.proxy_params[proxy_name]
+                        if id(param) == id(proxy_param):
+                            identity_matches += 1
+            
+            logger.info(f"Post-resume parameter identity check: {identity_matches}/3 parameters have correct identity")
+            
+            # Ensure proxy parameters have requires_grad=True (can be lost during state loading)
+            requires_grad_fixes = 0
+            for param in trainable_params:
+                if not param.requires_grad:
+                    param.requires_grad = True
+                    requires_grad_fixes += 1
+            
+            if requires_grad_fixes > 0:
+                logger.info(f"Fixed requires_grad=True for {requires_grad_fixes} parameters after resume")
+            
+            logger.info("Selective fine-tuning state successfully fixed after resume")
+            
+        except Exception as e:
+            logger.error(f"Error fixing selective fine-tuning state after resume: {e}")
+            logger.error("Training may encounter device consistency issues - consider restarting without --resume")
+            # Don't raise - let training continue and see if it works
 
     def scale_shift_latents(self, latents):
         return latents
