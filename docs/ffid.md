@@ -10,7 +10,7 @@ This allows full-finetuning to a targeted parameter space in the model, baking, 
 ## Notes
 
 *   **Note:** Only tested for Wan 2.2 (trained the low_noise weights)
-*   **Note2:** Doesnt work with bnb's adamw8bit, will result in an error:
+*   **Note2:** Doesnt work with bnb's adamw8bit, will result in an error (tested this with block swapping, maybe when everything is on GPU it's compatible):
     ```
     File "\site-packages\bitsandbytes\optim\optimizer.py", line 500, in update_step
     p.grad = p.grad.contiguous()
