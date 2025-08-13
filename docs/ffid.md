@@ -34,6 +34,9 @@ python wan_generate_video.py --task t2v-14B --video_length 1 --infer_steps 30 --
 
 **Sample:**
 
+![baseline](https://github.com/user-attachments/assets/6d83e544-fb6c-48fc-884b-b7ce5db1b3af)
+
+
 ### Trained character1 with --ff 0.001 --ffid 1 for x epochs
 
 **Full training command:**
@@ -44,7 +47,7 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 wan_tra
 ### character1.safetensors sample for prompt character1:
 
 ```
-python wan_generate_video.py --task t2v-14B --video_length 1 --infer_steps 30 --prompt "character1 sitting in a modern restaurant at night, wearing elegant dress" --save_path C:/train/saves/test/ --output_type both --dit "C:/train/saves/character1_512-000010.safetensors" --vae C:/train/saves/wan_2.1_vae.safetensors --t5 C:/train/ckpts/models_t5_umt5-xxl-enc-bf16.pth --attn_mode sdpa --seed 1234 --blocks_to_swap 24 --video_size 720 1280 --flow_shift 12 --seed 1234 --infer_steps 30 --video_length 1 --guidance_scale 3
+python wan_generate_video.py --task t2v-14B --video_length 1 --infer_steps 30 --prompt "character1 sitting in a modern restaurant at night, wearing elegant dress" --save_path C:/train/saves/test/ --output_type both --dit "C:/train/saves/character1_512-000010.safetensors" --vae C:/train/ckpts/wan_2.1_vae.safetensors --t5 C:/train/ckpts/models_t5_umt5-xxl-enc-bf16.pth --attn_mode sdpa --seed 1234 --blocks_to_swap 24 --video_size 720 1280 --flow_shift 12 --seed 1234 --infer_steps 30 --video_length 1 --guidance_scale 3
 ```
 
 **Sample:**
@@ -59,7 +62,7 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 wan_tra
 ### character1_2.safetensors sample for prompt character2:
 
 ```
-python wan_generate_video.py --task t2v-14B --video_length 1 --infer_steps 30 --prompt "character2 sitting in a modern restaurant at night, wearing elegant dress" --save_path C:/train/saves/test/ --output_type both --dit "C:/train/saves/character2_512-000010.safetensors" --vae C:/train/saves/wan_2.1_vae.safetensors --t5 C:/train/ckpts/models_t5_umt5-xxl-enc-bf16.pth --attn_mode sdpa --seed 1234 --blocks_to_swap 24 --video_size 720 1280 --flow_shift 12 --seed 1234 --infer_steps 30 --video_length 1 --guidance_scale 3
+python wan_generate_video.py --task t2v-14B --video_length 1 --infer_steps 30 --prompt "character2 sitting in a modern restaurant at night, wearing elegant dress" --save_path C:/train/saves/test/ --output_type both --dit "C:/train/saves/character2_512-000010.safetensors" --vae C:/train/ckpts/wan_2.1_vae.safetensors --t5 C:/train/ckpts/models_t5_umt5-xxl-enc-bf16.pth --attn_mode sdpa --seed 1234 --blocks_to_swap 24 --video_size 720 1280 --flow_shift 12 --seed 1234 --infer_steps 30 --video_length 1 --guidance_scale 3
 ```
 
 **Sample:**
@@ -67,7 +70,7 @@ python wan_generate_video.py --task t2v-14B --video_length 1 --infer_steps 30 --
 ### character1_2.safetensors sample for prompt character1, to verify knowledge of her is also intact:
 
 ```
-python wan_generate_video.py --task t2v-14B --video_length 1 --infer_steps 30 --prompt "character1 sitting in a modern restaurant at night, wearing elegant dress" --save_path C:/train/saves/test/ --output_type both --dit "C:/train/saves/character2_512-000010.safetensors" --vae C:/train/saves/wan_2.1_vae.safetensors --t5 C:/train/ckpts/models_t5_umt5-xxl-enc-bf16.pth --attn_mode sdpa --seed 1234 --blocks_to_swap 24 --video_size 720 1280 --flow_shift 12 --seed 1234 --infer_steps 30 --video_length 1 --guidance_scale 3
+python wan_generate_video.py --task t2v-14B --video_length 1 --infer_steps 30 --prompt "character1 sitting in a modern restaurant at night, wearing elegant dress" --save_path C:/train/saves/test/ --output_type both --dit "C:/train/saves/character2_512-000010.safetensors" --vae C:/train/ckpts/wan_2.1_vae.safetensors --t5 C:/train/ckpts/models_t5_umt5-xxl-enc-bf16.pth --attn_mode sdpa --seed 1234 --blocks_to_swap 24 --video_size 720 1280 --flow_shift 12 --seed 1234 --infer_steps 30 --video_length 1 --guidance_scale 3
 ```
 
 **Sample:**
