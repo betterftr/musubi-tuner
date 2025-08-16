@@ -49,8 +49,19 @@ import logging
 
 from musubi_tuner.utils import huggingface_utils, model_utils, train_utils, sai_model_spec
 
+# Import the debug flag for conditional selective fine-tuning debug messages
+try:
+    from musubi_tuner.utils.selective_finetune import TURN_ON_DEBUGS
+except ImportError:
+    TURN_ON_DEBUGS = False  # Default to False if not available
+
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+
+def selective_debug_log(message, level='info'):
+    """Log selective fine-tuning messages only if TURN_ON_DEBUGS is True"""
+    if TURN_ON_DEBUGS:
+        getattr(logger, level)(message)
 
 
 SS_METADATA_KEY_BASE_MODEL_VERSION = "ss_base_model_version"
@@ -992,10 +1003,6 @@ class NetworkTrainer:
         logger.info("")
         logger.info(f"generating sample images at step / サンプル画像生成 ステップ: {steps}")
         
-        # Debug weight changes before sampling for selective fine-tuning
-        if hasattr(self, 'training_debugger') and self.training_debugger is not None:
-            self.training_debugger.pre_sampling_check()
-        
         if sample_parameters is None:
             logger.error(f"No prompt file / プロンプトファイルがありません: {args.sample_prompts}")
             return
@@ -1004,6 +1011,12 @@ class NetworkTrainer:
 
         # Use the unwrapped model
         transformer = accelerator.unwrap_model(transformer)
+        
+        # CRITICAL FIX: Debug weight changes BEFORE switching to inference mode
+        # This ensures parameters are checked while still in training state
+        if TURN_ON_DEBUGS and hasattr(self, 'training_debugger') and self.training_debugger is not None:
+            self.training_debugger.pre_sampling_check()
+        
         transformer.switch_block_swap_for_inference()
 
         # Create a directory to save the samples
@@ -2060,7 +2073,7 @@ class NetworkTrainer:
                     accelerator.backward(loss)
                     
                     # Debug gradient flow for selective fine-tuning
-                    if hasattr(self, 'training_debugger') and self.training_debugger is not None:
+                    if TURN_ON_DEBUGS and hasattr(self, 'training_debugger') and self.training_debugger is not None:
                         self.training_debugger.log_gradient_flow(loss, global_step)
                     
                     if accelerator.sync_gradients:
@@ -2080,7 +2093,7 @@ class NetworkTrainer:
                         # Extra aggressive checking if we just resumed (reduced spam)
                         if hasattr(self, "_selective_ft_resume_device_check") and self._selective_ft_resume_device_check and global_step < 5:
                             if global_step == 0:  # Only log on first step
-                                logger.info(f"Post-resume device validation at step {global_step}...")
+                                selective_debug_log(f"Post-resume device validation at step {global_step}...")
                             
                             # Check all parameters and their gradients
                             trainable_params = self.selective_finetuner.get_trainable_parameters()
@@ -2098,11 +2111,11 @@ class NetworkTrainer:
                             # Turn off aggressive checking after step 3 (earlier)
                             if global_step >= 3:
                                 self._selective_ft_resume_device_check = False
-                                logger.info("Resume device validation complete - training should be stable now")
+                                selective_debug_log("Resume device validation complete - training should be stable now")
                         
                         # CRITICAL: Fix optimizer state device issues on first step after resume
                         if hasattr(self, "_selective_ft_optimizer_device_fix_needed") and self._selective_ft_optimizer_device_fix_needed:
-                            logger.info("FIXING OPTIMIZER STATE DEVICE CONSISTENCY after resume...")
+                            selective_debug_log("FIXING OPTIMIZER STATE DEVICE CONSISTENCY after resume...")
                             
                             # Get the actual optimizer (unwrap from accelerator)
                             actual_optimizer = optimizer.optimizer if hasattr(optimizer, 'optimizer') else optimizer
@@ -2121,9 +2134,9 @@ class NetworkTrainer:
                                             fixed_optimizer_states += 1
                             
                             if fixed_optimizer_states > 0:
-                                logger.info(f"Fixed {fixed_optimizer_states} optimizer state tensors to match parameter devices")
+                                selective_debug_log(f"Fixed {fixed_optimizer_states} optimizer state tensors to match parameter devices")
                             else:
-                                logger.info("Optimizer state devices already consistent with parameters")
+                                selective_debug_log("Optimizer state devices already consistent with parameters")
                             
                             # Only do this once
                             self._selective_ft_optimizer_device_fix_needed = False

@@ -25,13 +25,19 @@ import logging
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
+def selective_debug_log(message, level='info'):
+    """Log selective fine-tuning messages only if TURN_ON_DEBUGS is True"""
+    if TURN_ON_DEBUGS:
+        getattr(logger, level)(message)
+
 from musubi_tuner.utils import model_utils
 from musubi_tuner.utils.safetensors_utils import load_safetensors, MemoryEfficientSafeOpen
 from musubi_tuner.utils.selective_finetune import (
     SelectiveFinetuneManager,
     SelectiveFinetuneWrapper,
     is_selective_finetuning_enabled,
-    validate_selective_finetuning_args
+    validate_selective_finetuning_args,
+    TURN_ON_DEBUGS
 )
 from musubi_tuner.utils.training_debug import add_selective_training_debug
 from musubi_tuner.wan.configs import WAN_CONFIGS
@@ -107,14 +113,14 @@ class WanNetworkTrainer(NetworkTrainer):
         self.selective_finetuning_enabled = is_selective_finetuning_enabled(args)
         if self.selective_finetuning_enabled:
             validate_selective_finetuning_args(args)
-            logger.info(f"Selective fine-tuning enabled: fraction={args.ff:.6f}, selection_id={args.ffid}")
+            selective_debug_log(f"Selective fine-tuning enabled: fraction={args.ff:.6f}, selection_id={args.ffid}")
             
             # Validate compatibility with other settings
             if self.high_low_training:
                 raise ValueError("Selective fine-tuning is not compatible with high-low training (--dit_high_noise)")
             
             if args.blocks_to_swap is not None and args.blocks_to_swap > 0:
-                logger.warning("Block swapping is not recommended with selective fine-tuning as the main model stays on CPU")
+                selective_debug_log("Block swapping is not recommended with selective fine-tuning as the main model stays on CPU", 'warning')
         
         self.selective_finetuner = None
         self.selective_finetuning_wrapper = None
@@ -493,7 +499,7 @@ class WanNetworkTrainer(NetworkTrainer):
         
         # Set up selective fine-tuning if enabled  
         if is_selective_finetuning_enabled(args):
-            logger.info("Setting up selective fine-tuning manager...")
+            selective_debug_log("Setting up selective fine-tuning manager...")
             self.selective_finetuner = SelectiveFinetuneManager(model, args.ff, args.ffid)
             
             # Move proxy parameters to GPU device
@@ -505,11 +511,10 @@ class WanNetworkTrainer(NetworkTrainer):
             # Create wrapper that presents the standard model interface
             self.selective_finetuning_wrapper = SelectiveFinetuneWrapper(model, self.selective_finetuner)
             
-            # Log memory usage
+            # Log parameter count
             memory_info = self.selective_finetuner.get_memory_info()
-            logger.info(f"Selective fine-tuning memory usage: "
-                       f"{memory_info['proxy_param_count']:,} proxy parameters, "
-                       f"estimated VRAM: {memory_info['estimated_proxy_memory_mb']:.1f}MB")
+            logger.info(f"Selective fine-tuning: training {memory_info['proxy_param_count']:,} proxy parameters "
+                       f"({memory_info['fraction_actual']:.3f}% of model)")
             
             logger.info("Selective fine-tuning setup complete - wrapper will be used as network")
             
@@ -519,7 +524,7 @@ class WanNetworkTrainer(NetworkTrainer):
             
             # Setup training debugger
             self.training_debugger = add_selective_training_debug(self.selective_finetuner)
-            logger.info("Training debugger enabled for selective fine-tuning")
+            selective_debug_log("Training debugger enabled for selective fine-tuning")
         
         if self.high_low_training:
             # load high noise model
@@ -573,42 +578,42 @@ class WanNetworkTrainer(NetworkTrainer):
         if not (is_selective_finetuning_enabled(args) and hasattr(self, 'selective_finetuner')):
             return
             
-        logger.info("Fixing selective fine-tuning state after resume...")
+        selective_debug_log("Fixing selective fine-tuning state after resume...")
         
         try:
             # Validate that selective fine-tuning configuration matches
             if hasattr(args, 'resume') and args.resume:
-                logger.info(f"Resuming with selective fine-tuning: --ff {args.ff:.6f} --ffid {args.ffid}")
+                selective_debug_log(f"Resuming with selective fine-tuning: --ff {args.ff:.6f} --ffid {args.ffid}")
                 
                 # Validate configuration matches what was saved
                 expected_fraction = self.selective_finetuner.fraction
                 expected_selection_id = self.selective_finetuner.selection_id
                 
                 if abs(args.ff - expected_fraction) > 1e-9:
-                    logger.warning(f"Resume --ff {args.ff:.6f} differs from saved fraction {expected_fraction:.6f}")
+                    selective_debug_log(f"Resume --ff {args.ff:.6f} differs from saved fraction {expected_fraction:.6f}", 'warning')
                 
                 if args.ffid != expected_selection_id:
-                    logger.warning(f"Resume --ffid {args.ffid} differs from saved selection_id {expected_selection_id}")
+                    selective_debug_log(f"Resume --ffid {args.ffid} differs from saved selection_id {expected_selection_id}", 'warning')
             
             # Fix device consistency issues that can occur after state loading
-            logger.info("Ensuring gradient-parameter device consistency for selective fine-tuning...")
+            selective_debug_log("Ensuring gradient-parameter device consistency for selective fine-tuning...")
             fixed_gradients = self.selective_finetuner.ensure_gradient_device_consistency()
             
             if fixed_gradients > 0:
-                logger.info(f"Fixed device consistency for {fixed_gradients} parameters after resume")
+                selective_debug_log(f"Fixed device consistency for {fixed_gradients} parameters after resume")
             else:
-                logger.info("All parameters and gradients already have consistent devices")
+                selective_debug_log("All parameters and gradients already have consistent devices")
             
             # CRITICAL: Also check if optimizer might have stale device references
             # Force a validation by creating temporary gradients and checking device consistency
-            logger.info("Performing comprehensive device consistency validation...")
+            selective_debug_log("Performing comprehensive device consistency validation...")
             trainable_params = self.selective_finetuner.get_trainable_parameters()
             cpu_params = sum(1 for p in trainable_params if p.device.type == 'cpu')
             gpu_params = sum(1 for p in trainable_params if p.device.type == 'cuda')
             
-            logger.info(f"Post-resume parameter device distribution: {cpu_params} on CPU, {gpu_params} on GPU")
+            selective_debug_log(f"Post-resume parameter device distribution: {cpu_params} on CPU, {gpu_params} on GPU")
             if cpu_params > 0 and gpu_params > 0:
-                logger.info("Mixed device setup detected - this is expected with block swapping")
+                selective_debug_log("Mixed device setup detected - this is expected with block swapping")
             
             # Store a flag to indicate we need extra device checking during first few steps
             self._selective_ft_resume_device_check = True
@@ -616,7 +621,7 @@ class WanNetworkTrainer(NetworkTrainer):
             # CRITICAL FIX: The optimizer's internal state (momentum buffers) may still have 
             # references to old devices. We need to flag that optimizer state needs device fixing.
             self._selective_ft_optimizer_device_fix_needed = True
-            logger.info("Marked optimizer for device consistency fixing in first training step")
+            selective_debug_log("Marked optimizer for device consistency fixing in first training step")
             
             # Re-validate parameter identity consistency (critical for optimizer)
             trainable_params = self.selective_finetuner.get_trainable_parameters()
@@ -632,7 +637,7 @@ class WanNetworkTrainer(NetworkTrainer):
                         if id(param) == id(proxy_param):
                             identity_matches += 1
             
-            logger.info(f"Post-resume parameter identity check: {identity_matches}/3 parameters have correct identity")
+            selective_debug_log(f"Post-resume parameter identity check: {identity_matches}/3 parameters have correct identity")
             
             # Ensure proxy parameters have requires_grad=True (can be lost during state loading)
             requires_grad_fixes = 0
@@ -642,9 +647,9 @@ class WanNetworkTrainer(NetworkTrainer):
                     requires_grad_fixes += 1
             
             if requires_grad_fixes > 0:
-                logger.info(f"Fixed requires_grad=True for {requires_grad_fixes} parameters after resume")
+                selective_debug_log(f"Fixed requires_grad=True for {requires_grad_fixes} parameters after resume")
             
-            logger.info("Selective fine-tuning state successfully fixed after resume")
+            selective_debug_log("Selective fine-tuning state successfully fixed after resume")
             
         except Exception as e:
             logger.error(f"Error fixing selective fine-tuning state after resume: {e}")
@@ -837,7 +842,7 @@ class WanNetworkTrainer(NetworkTrainer):
         """
         # For selective fine-tuning, completely bypass the LoRA/network path
         if is_selective_finetuning_enabled(args):
-            logger.info("Starting selective fine-tuning training (bypassing LoRA/network modules)...")
+            selective_debug_log("Starting selective fine-tuning training (bypassing LoRA/network modules)...")
             
             # Validate selective fine-tuning arguments early
             validate_selective_finetuning_args(args)
@@ -886,7 +891,7 @@ class WanNetworkTrainer(NetworkTrainer):
         
         def create_arch_network(*args, **kwargs):
             """Return the selective fine-tuning wrapper as the network."""
-            logger.info("Returning selective fine-tuning wrapper as network")
+            selective_debug_log("Returning selective fine-tuning wrapper as network")
             # The wrapper should have been created in load_transformer by now
             if hasattr(self, 'selective_finetuning_wrapper'):
                 return self.selective_finetuning_wrapper

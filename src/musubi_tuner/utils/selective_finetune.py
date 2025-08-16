@@ -15,10 +15,44 @@ import logging
 import random
 import torch
 import torch.nn as nn
-from typing import Dict, List, Tuple, Optional, Any
-from collections import OrderedDict
+from typing import Dict, List, Tuple, Optional, Any, Union
+from collections import defaultdict
+
+# Production flag to disable all selective fine-tuning debug messages
+TURN_ON_DEBUGS = False
 
 logger = logging.getLogger(__name__)
+
+
+def debug_log(level, message, *args, **kwargs):
+    """Conditional logging based on TURN_ON_DEBUGS flag"""
+    if TURN_ON_DEBUGS:
+        getattr(logger, level)(message, *args, **kwargs)
+
+
+# Override logger methods to be conditional for selective fine-tuning
+class ConditionalLogger:
+    def __init__(self, original_logger):
+        self._logger = original_logger
+    
+    def info(self, message, *args, **kwargs):
+        if TURN_ON_DEBUGS:
+            self._logger.info(message, *args, **kwargs)
+    
+    def debug(self, message, *args, **kwargs):
+        if TURN_ON_DEBUGS:
+            self._logger.debug(message, *args, **kwargs)
+    
+    def warning(self, message, *args, **kwargs):
+        if TURN_ON_DEBUGS:
+            self._logger.warning(message, *args, **kwargs)
+    
+    def error(self, message, *args, **kwargs):
+        # Always log errors regardless of debug flag
+        self._logger.error(message, *args, **kwargs)
+
+# Replace logger with conditional version
+logger = ConditionalLogger(logger)
 
 
 def get_all_trainable_parameters(model: nn.Module) -> Dict[str, nn.Parameter]:
@@ -39,259 +73,148 @@ def get_all_trainable_parameters(model: nn.Module) -> Dict[str, nn.Parameter]:
 
 
 def select_parameters_deterministic(
-    all_params: Dict[str, nn.Parameter], 
-    fraction: float, 
-    selection_id: int
-) -> List[str]:
+    all_params: Dict[str, nn.Parameter],
+    fraction: float,
+    selection_id: int,
+    return_slice_metadata: bool = False
+) -> Union[List[str], Tuple[List[str], Dict]]:
     """
-    Deterministically select a fraction of parameters evenly distributed across the model.
-    Selection is based on total parameter count, not number of tensors.
+    Selects a deterministic, non-overlapping, and evenly distributed fraction of model parameters.
+    """
     
-    Args:
-        all_params: Dictionary of all available parameters
-        fraction: Fraction of parameters to select (e.g., 0.00001)
-        selection_id: ID for deterministic selection (seed)
-        
-    Returns:
-        List of selected parameter names
-    """
-    # Set random seed for deterministic selection
     original_state = random.getstate()
-    random.seed(selection_id)
-    
+    random.seed(42)
+
+    # Deterministic shuffle for the local tie-breaker
+    attn_components = ['q', 'k', 'v', 'o']
+    random.shuffle(attn_components)
+    attn_component_priority = {name: i for i, name in enumerate(attn_components)}
+
+    def get_param_priority(param_name: str) -> int:
+        name_parts = param_name.split('.')
+        # This part is for stripping block numbers to generalize the component name
+        if len(name_parts) > 2 and name_parts[0] == 'blocks' and name_parts[1].isdigit():
+            param_name = '.'.join(name_parts[2:])
+        # This is the simple priority scheme
+        if ('attn' in param_name or 'ffn' in param_name) and 'weight' in param_name: return 0
+        if ('attn' in param_name or 'ffn' in param_name) and 'bias' in param_name: return 1
+        if 'norm' in param_name: return 2
+        return 3
+
+    # --- Helper function for the new, more detailed LOCAL sorting within blocks ---
+    def get_local_sort_key(param_info: Tuple[str, int]) -> tuple:
+        name, count = param_info
+        
+        # Default sort is by size, then name
+        key = (count, name)
+        
+        # For attn weights of the same size, we introduce a deterministic sub-priority
+        local_name = name
+        name_parts = name.split('.')
+        if len(name_parts) > 2 and name_parts[0] == 'blocks' and name_parts[1].isdigit():
+            local_name = '.'.join(name_parts[2:])
+            
+        if 'attn' in local_name and 'weight' in local_name:
+            component = local_name.split('.')[-2]
+            if component in attn_component_priority:
+                # Tie-break by component priority, THEN by name
+                key = (count, attn_component_priority[component], name)
+                
+        return key
+
     try:
-        # Calculate total parameter count across all tensors
-        total_model_params = sum(param.numel() for param in all_params.values())
+        total_model_params = sum(p.numel() for p in all_params.values())
         target_param_count = max(1, int(total_model_params * fraction))
+        logger.info(f"Target: {target_param_count:,} params ({fraction:.6f}) for set {selection_id}")
+
+        all_param_list = sorted([(n, p.numel()) for n, p in all_params.items()],
+                                key=lambda x: (get_param_priority(x[0]), x[1], x[0]))
+
+        num_sets = 8
+        partitioned_pool = [
+            (n, c) for idx, (n, c) in enumerate(all_param_list)
+            if idx % num_sets == selection_id
+        ]
+        logger.info(f"Partitioned pool size: {len(partitioned_pool)} tensors")
         
-        logger.info(f"Target: {target_param_count:,} parameters out of {total_model_params:,} "
-                   f"(fraction={fraction:.6f}, selection_id={selection_id})")
-        
-        # Create list of (param_name, param_count) sorted by count
-        param_info = [(name, param.numel()) for name, param in all_params.items()]
-        param_info.sort(key=lambda x: x[1])  # Sort by parameter count (smallest first)
-        
-        # Group parameters by component type for even distribution across ALL components
-        # CRITICAL: Individual blocks must be separate groups to ensure even distribution
-        # across early blocks (character) and later blocks (style) as specified in CLAUDE.md
-        param_groups = {
-            'patch_embedding': [],
-            'text_embedding': [],
-            'time_embedding': [],
-            'time_projection': [],
-            'head': [],
-            'other': []
-        }
-        
-        # Add individual block groups (blocks.0, blocks.1, ..., blocks.39)
-        for i in range(40):  # Wan DiT has 40 blocks
-            param_groups[f'blocks.{i}'] = []
-        
-        for name, count in param_info:
-            if 'patch_embedding' in name:
-                param_groups['patch_embedding'].append((name, count))
-            elif 'text_embedding' in name:
-                param_groups['text_embedding'].append((name, count))
-            elif 'time_embedding' in name:
-                param_groups['time_embedding'].append((name, count))
-            elif 'time_projection' in name:
-                param_groups['time_projection'].append((name, count))
-            elif 'blocks.' in name:
-                # Extract block number and assign to individual block group
-                try:
-                    block_parts = name.split('.')
-                    if len(block_parts) >= 2 and block_parts[0] == 'blocks':
-                        block_num = int(block_parts[1])
-                        if 0 <= block_num < 40:
-                            param_groups[f'blocks.{block_num}'].append((name, count))
-                        else:
-                            param_groups['other'].append((name, count))
-                    else:
-                        param_groups['other'].append((name, count))
-                except (ValueError, IndexError):
-                    param_groups['other'].append((name, count))
-            elif 'head.' in name:
-                param_groups['head'].append((name, count))
+        block_params = defaultdict(list)
+        non_block_params = []
+        for name, count in partitioned_pool:
+            if 'blocks.' in name and name.split('.')[1].isdigit():
+                block_num = int(name.split('.')[1])
+                block_params[block_num].append((name, count))
             else:
-                param_groups['other'].append((name, count))
+                non_block_params.append((name, count))
+
+        candidate_pool = []
         
-        # MATHEMATICALLY CORRECT STRATEGY: Guarantee all 40 blocks coverage first
-        # Phase 1: Select smallest parameter from each block (guaranteed coverage)
-        # Phase 2: Use remaining budget for additional parameters across all blocks
+
+        for block_num in sorted(block_params.keys()):
+            block_params[block_num].sort(key=get_local_sort_key)
         
-        selected_params = []
-        selected_param_count = 0
+        max_depth = max(len(p) for p in block_params.values()) if block_params else 0
+        for rank in range(max_depth):
+            for block_num in sorted(block_params.keys()):
+                if rank < len(block_params[block_num]):
+                    candidate_pool.append(block_params[block_num][rank])
         
-        logger.info("=== PHASE 1: Guaranteeing coverage of ALL 40 blocks ===")
+        non_block_params.sort(key=lambda x: (x[1], x[0]))
+        candidate_pool.extend(non_block_params)
         
-        # Step 1: Identify all block groups and ensure we cover ALL 40 blocks
-        block_groups = {gname: gparams for gname, gparams in param_groups.items() 
-                       if gname.startswith('blocks.')}
-        non_block_groups = {gname: gparams for gname, gparams in param_groups.items() 
-                           if not gname.startswith('blocks.') and gparams}
+        logger.info(f"Created a balanced candidate pool of {len(candidate_pool)} tensors.")
         
-        logger.info(f"Found {len(block_groups)} block groups and {len(non_block_groups)} non-block groups")
-        
-        # Phase 1: Select ONE smallest parameter from each block (guaranteed 40-block coverage)
-        covered_blocks = set()
-        phase1_budget = target_param_count // 2  # Reserve half budget for guaranteed coverage
-        
-        # Process block groups in deterministic order
-        for group_name in sorted(block_groups.keys()):
-            group_params = block_groups[group_name]
-            if not group_params:
-                continue
-                
-            # Sort by size (smallest first) for guaranteed fit
-            group_params.sort(key=lambda x: x[1])
+        selected_params = {}
+        current_sum = 0
+        for name, count in candidate_pool:
+            selected_params[name] = count
+            current_sum += count
             
-            # Use selection_id for deterministic offset within each block
-            block_num = int(group_name.split('.')[1])
-            param_offset = (selection_id + block_num) % len(group_params)
-            
-            # Select the parameter at the offset, or smallest if it doesn't fit
-            selected_param = None
-            for attempt in range(len(group_params)):
-                idx = (param_offset + attempt) % len(group_params)
-                param_name, param_count = group_params[idx]
-                
-                if selected_param_count + param_count <= phase1_budget:
-                    selected_param = (param_name, param_count)
-                    break
-            
-            # If no parameter fits in phase1_budget, take the smallest anyway (essential for coverage)
-            if selected_param is None and group_params:
-                selected_param = group_params[0]  # Smallest parameter
-                logger.warning(f"Phase 1 budget exceeded, taking smallest param from {group_name}")
-            
-            if selected_param:
-                param_name, param_count = selected_param
-                selected_params.append(selected_param)
-                selected_param_count += param_count
-                covered_blocks.add(block_num)
-                logger.info(f"Phase 1: Selected {param_name} from {group_name}: {param_count:,} parameters")
+            if current_sum >= target_param_count:
+                break
+
+        selected_param_names = list(selected_params.keys())
+        logger.info(f"Final selection: {len(selected_params)} tensors, {current_sum:,} params")
         
-        logger.info(f"Phase 1 complete: Covered {len(covered_blocks)} blocks with {selected_param_count:,} parameters")
-        
-        # Step 2: Use remaining budget for non-block components and additional block parameters
-        logger.info("=== PHASE 2: Using remaining budget for additional parameters ===")
-        remaining_budget = target_param_count - selected_param_count
-        
-        if remaining_budget > 0:
-            # Collect all unselected parameters
-            all_unselected = []
+        if return_slice_metadata:
+            slice_metadata = {}
+            component_distribution = defaultdict(int)
+            block_distribution = defaultdict(int)
+
+            for name, count in selected_params.items():
+                if 'blocks.' in name:
+                    component_distribution['blocks'] += count
+                    try:
+                        block_num = int(name.split('.')[1])
+                        block_distribution[f'block_{block_num}'] += count
+                    except (ValueError, IndexError):
+                        component_distribution['other'] += count
+                elif 'embedding' in name:
+                    component_distribution['embeddings'] += count
+                elif 'head' in name:
+                    component_distribution['head'] += count
+                else:
+                    component_distribution['other'] += count
+
+            slice_metadata['total_model_params'] = total_model_params
+            slice_metadata['target_param_count'] = target_param_count
+            slice_metadata['selected_param_count'] = current_sum
+            slice_metadata['selected_tensor_count'] = len(selected_param_names)
+            slice_metadata['actual_fraction'] = current_sum / total_model_params if total_model_params > 0 else 0
+            slice_metadata['component_distribution'] = dict(component_distribution)
+            slice_metadata['block_distribution'] = dict(block_distribution)
             
-            # Add non-block parameters
-            for group_name, group_params in non_block_groups.items():
-                for param_name, param_count in group_params:
-                    if param_name not in [p[0] for p in selected_params]:
-                        all_unselected.append((param_name, param_count, group_name))
-            
-            # Add remaining block parameters
-            for group_name, group_params in block_groups.items():
-                for param_name, param_count in group_params:
-                    if param_name not in [p[0] for p in selected_params]:
-                        all_unselected.append((param_name, param_count, group_name))
-            
-            # Sort deterministically for consistent selection
-            all_unselected.sort(key=lambda x: x[0])
-            
-            # Use selection_id to determine starting point for phase 2
-            if all_unselected:
-                start_idx = selection_id % len(all_unselected)
-                
-                # Select parameters in round-robin fashion until budget exhausted
-                for i in range(len(all_unselected)):
-                    idx = (start_idx + i) % len(all_unselected)
-                    param_name, param_count, group_name = all_unselected[idx]
-                    
-                    if param_count <= remaining_budget:
-                        selected_params.append((param_name, param_count))
-                        selected_param_count += param_count
-                        remaining_budget -= param_count
-                        logger.info(f"Phase 2: Selected {param_name} from {group_name}: {param_count:,} parameters")
-                    
-                    if remaining_budget <= 0:
-                        break
-        
-        logger.info(f"Phase 2 complete: Total selected {selected_param_count:,} parameters")
-        logger.info(f"Block coverage verification: {len(covered_blocks)}/40 blocks covered")
-        
-        if len(covered_blocks) < 40:
-            # Log which blocks are missing
-            missing_blocks = set(range(40)) - covered_blocks
-            logger.warning(f"Missing blocks: {sorted(missing_blocks)}")
+            return selected_param_names, slice_metadata
         else:
-            logger.info("✅ Perfect coverage: ALL 40 blocks covered!")
-        
-        # Extract just the parameter names
-        selected_param_names = [name for name, count in selected_params]
-        
-        actual_fraction = selected_param_count / total_model_params
-        
-        # Log distribution across individual blocks to verify even distribution
-        block_distribution = {}
-        component_distribution = {}
-        
-        for name, count in selected_params:
-            if 'blocks.' in name:
-                try:
-                    block_parts = name.split('.')
-                    if len(block_parts) >= 2 and block_parts[0] == 'blocks':
-                        block_num = int(block_parts[1])
-                        block_key = f"block_{block_num}"
-                        block_distribution[block_key] = block_distribution.get(block_key, 0) + count
-                except (ValueError, IndexError):
-                    pass
-            
-            # Track component distribution
-            if 'patch_embedding' in name:
-                component_distribution['patch_embedding'] = component_distribution.get('patch_embedding', 0) + count
-            elif 'text_embedding' in name:
-                component_distribution['text_embedding'] = component_distribution.get('text_embedding', 0) + count
-            elif 'time_embedding' in name:
-                component_distribution['time_embedding'] = component_distribution.get('time_embedding', 0) + count
-            elif 'time_projection' in name:
-                component_distribution['time_projection'] = component_distribution.get('time_projection', 0) + count
-            elif 'head.' in name:
-                component_distribution['head'] = component_distribution.get('head', 0) + count
-            elif 'blocks.' in name:
-                component_distribution['blocks'] = component_distribution.get('blocks', 0) + count
-            else:
-                component_distribution['other'] = component_distribution.get('other', 0) + count
-        
-        logger.info(f"Final selection: {len(selected_param_names)} parameter tensors")
-        logger.info(f"Total selected: {selected_param_count:,} parameters out of {total_model_params:,}")
-        logger.info(f"Actual fraction: {actual_fraction:.6f} (target: {fraction:.6f})")
-        logger.info(f"Difference: {abs(actual_fraction - fraction)/fraction*100:.1f}% from target")
-        
-        # Log component distribution
-        logger.info("Parameter distribution by component:")
-        for component, count in sorted(component_distribution.items()):
-            percentage = (count / selected_param_count) * 100
-            logger.info(f"  {component}: {count:,} parameters ({percentage:.1f}%)")
-        
-        # Log block distribution (only if we have block parameters)
-        if block_distribution:
-            block_count = len(block_distribution)
-            logger.info(f"Parameter distribution across {block_count} blocks:")
-            for block_key in sorted(block_distribution.keys(), key=lambda x: int(x.split('_')[1])):
-                count = block_distribution[block_key]
-                percentage = (count / selected_param_count) * 100
-                logger.info(f"  {block_key}: {count:,} parameters ({percentage:.1f}%)")
-        else:
-            logger.info("No block parameters selected in this subset")
-        
-        return selected_param_names
-        
+            return selected_param_names
+
     finally:
-        # Restore original random state
         random.setstate(original_state)
 
 
 def create_proxy_parameters(
     model: nn.Module, 
-    selected_param_names: List[str]
+    selected_param_names: List[str],
+    slice_metadata: Dict[str, Tuple[int, int]] = None
 ) -> Tuple[nn.ParameterDict, Dict[str, Tuple[str, torch.Size, torch.dtype]]]:
     """
     Create proxy parameters for the selected subset and replace original parameters.
@@ -299,6 +222,7 @@ def create_proxy_parameters(
     Args:
         model: The model containing the original parameters
         selected_param_names: Names of parameters to create proxies for
+        slice_metadata: Optional dict mapping param names to (slice_count, original_count)
         
     Returns:
         Tuple of (proxy_parameters, parameter_metadata)
@@ -307,6 +231,7 @@ def create_proxy_parameters(
     """
     proxy_params = nn.ParameterDict()
     param_metadata = {}
+    slice_metadata = slice_metadata or {}
     
     model_params = dict(model.named_parameters())
     
@@ -317,16 +242,44 @@ def create_proxy_parameters(
             
         original_param = model_params[param_name]
         
-        # Create proxy parameter with same shape and dtype
-        proxy_name = f"proxy_{i:06d}"
-        proxy_param = nn.Parameter(
-            torch.zeros_like(original_param, device='cpu'),
-            requires_grad=True
-        )
-        
-        # Copy current values from original parameter
-        with torch.no_grad():
-            proxy_param.data.copy_(original_param.data)
+        # Check if this parameter needs slicing
+        if param_name in slice_metadata:
+            slice_count, original_count = slice_metadata[param_name]
+            # Calculate slice dimensions - slice from the first dimension
+            original_shape = original_param.shape
+            original_numel = original_param.numel()
+            
+            if original_numel != original_count:
+                logger.warning(f"Mismatch: {param_name} has {original_numel} elements, expected {original_count}")
+            
+            # Calculate how to slice the first dimension to get approximately slice_count parameters
+            first_dim = original_shape[0]
+            slice_first_dim = max(1, int((slice_count / original_numel) * first_dim))
+            slice_shape = (slice_first_dim,) + original_shape[1:]
+            
+            # Create proxy parameter with sliced shape
+            proxy_name = f"proxy_{i:06d}"
+            proxy_param = nn.Parameter(
+                torch.zeros(slice_shape, dtype=original_param.dtype, device='cpu'),
+                requires_grad=True
+            )
+            
+            # Copy sliced values from original parameter
+            with torch.no_grad():
+                proxy_param.data.copy_(original_param.data[:slice_first_dim])
+            
+            logger.info(f"Sliced {param_name}: {original_shape} -> {slice_shape} ({proxy_param.numel():,} params)")
+        else:
+            # Create proxy parameter with same shape and dtype (no slicing)
+            proxy_name = f"proxy_{i:06d}"
+            proxy_param = nn.Parameter(
+                torch.zeros_like(original_param, device='cpu'),
+                requires_grad=True
+            )
+            
+            # Copy current values from original parameter
+            with torch.no_grad():
+                proxy_param.data.copy_(original_param.data)
         
         proxy_params[proxy_name] = proxy_param
         param_metadata[proxy_name] = (param_name, original_param.shape, original_param.dtype)
@@ -335,6 +288,21 @@ def create_proxy_parameters(
         # This ensures gradients flow to the proxy parameter during training
         # Note: Keep proxy on CPU initially, will be moved to correct device later
         _replace_model_parameter(model, param_name, proxy_param)
+        
+        # CRITICAL FIX: Verify the parameter was actually replaced and is accessible for gradients
+        verification_params = dict(model.named_parameters())
+        if param_name in verification_params:
+            replaced_param = verification_params[param_name]
+            if id(replaced_param) == id(proxy_param):
+                logger.debug(f"✓ Parameter replacement verified for {param_name}")
+                # Ensure the replaced parameter maintains gradient computation
+                if not replaced_param.requires_grad:
+                    logger.warning(f"Fixed requires_grad for replaced parameter {param_name}")
+                    replaced_param.requires_grad = True
+            else:
+                logger.error(f"✗ Parameter replacement failed for {param_name} - IDs don't match")
+        else:
+            logger.error(f"✗ Parameter {param_name} not found after replacement")
         
         logger.debug(f"Created and replaced proxy {proxy_name} for {param_name} "
                     f"shape={original_param.shape}")
@@ -514,14 +482,14 @@ class SelectiveFinetuneManager:
         # Get all trainable parameters
         all_params = get_all_trainable_parameters(self.model)
         
-        # Select subset deterministically
-        self.selected_param_names = select_parameters_deterministic(
-            all_params, self.fraction, self.selection_id
+        # Select subset deterministically (request slice metadata for slicing support)
+        self.selected_param_names, self.slice_metadata = select_parameters_deterministic(
+            all_params, self.fraction, self.selection_id, return_slice_metadata=True
         )
         
-        # Create proxy parameters
+        # Create proxy parameters (with slicing support)
         self.proxy_params, self.param_metadata = create_proxy_parameters(
-            self.model, self.selected_param_names
+            self.model, self.selected_param_names, self.slice_metadata
         )
         
         # PHASE 2 FIX: Ensure all parameters have requires_grad=True after creation
@@ -543,11 +511,19 @@ class SelectiveFinetuneManager:
         model_params = dict(self.model.named_parameters())
         trainable_params = []
         requires_grad_fixes = 0
+        identity_mismatches = 0
         
         for proxy_name in self.param_metadata:
             original_name, _, _ = self.param_metadata[proxy_name]
             if original_name in model_params:
                 param = model_params[original_name]
+                
+                # CRITICAL: Verify this is actually our proxy parameter
+                if proxy_name in self.proxy_params:
+                    proxy_param = self.proxy_params[proxy_name]
+                    if id(param) != id(proxy_param):
+                        identity_mismatches += 1
+                        logger.error(f"Parameter identity mismatch for {original_name}: model_id={id(param)}, proxy_id={id(proxy_param)}")
                 
                 # CRITICAL FIX: Ensure the parameter has requires_grad=True
                 if not param.requires_grad:
@@ -557,10 +533,13 @@ class SelectiveFinetuneManager:
                 
                 trainable_params.append(param)
         
-        # PHASE 1 DEBUG: Log summary of requires_grad fixes
+        # Log critical issues
+        if identity_mismatches > 0:
+            logger.error(f"=== CRITICAL: {identity_mismatches} parameter identity mismatches detected ===")
+            logger.error("This will prevent training from working correctly!")
+        
         if requires_grad_fixes > 0:
-            logger.warning(f"=== PHASE 1 DEBUG: Fixed requires_grad=False for {requires_grad_fixes}/{len(trainable_params)} parameters ===")
-            logger.warning(f"This indicates parameters are losing requires_grad=True somewhere in the setup process")
+            logger.warning(f"Fixed requires_grad=False for {requires_grad_fixes}/{len(trainable_params)} parameters")
         
         logger.debug(f"Returning {len(trainable_params)} trainable parameters from model")
         return trainable_params
@@ -658,6 +637,13 @@ class SelectiveFinetuneManager:
                         logger.error(f"IDENTITY MISMATCH: {original_name} proxy_id={id(proxy_param)} vs model_id={id(model_param)}")
         
         logger.info(f"Parameter identity verification: {identity_matches}/{len(self.proxy_params)} parameters have matching IDs")
+        
+        # Update debug state if debugger is attached
+        if hasattr(self, '_update_debug_state'):
+            try:
+                self._update_debug_state()
+            except Exception as e:
+                logger.debug(f"Failed to update debug state: {e}")
     
     def setup_block_swapping_compatibility(self, blocks_to_swap: int, device: torch.device):
         """
@@ -866,16 +852,12 @@ class SelectiveFinetuneManager:
         proxy_param_count = sum(p.numel() for p in self.proxy_params.values())
         total_model_params = sum(p.numel() for p in self.model.parameters())
         
-        # Estimate memory usage (assuming float32 for simplicity)
-        proxy_memory_mb = proxy_param_count * 4 / (1024 * 1024)
-        
         return {
             "status": "initialized",
             "proxy_parameters": len(self.proxy_params),
             "proxy_param_count": proxy_param_count,
             "total_model_params": total_model_params,
             "fraction_actual": proxy_param_count / total_model_params,
-            "estimated_proxy_memory_mb": proxy_memory_mb,
             "selected_param_names": self.selected_param_names[:10] + ["..."] if len(self.selected_param_names) > 10 else self.selected_param_names
         }
     
