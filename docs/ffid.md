@@ -11,16 +11,16 @@ This allows full-finetuning to a targeted parameter space in the model, baking, 
 
 The algorithm is designed to be deterministic, non-overlapping, and strategically intelligent. It is robust to any fraction (`--ff`) by satisfying two non-negotiable goals: **40/40 block coverage** and **meaningful training impact**. It achieves this through a priority-aware, single-pass selection from a specially constructed candidate pool that ensures high-priority parameters are spread evenly across all layers.
 
-1.  **Zero Overlap (Partitioning):**
-    *   First, all model parameters are deterministically sorted by name to create a consistent global order.
-    *   This list is then "dealt" into a fixed number of separate pools, much like dealing cards. The `--ffid` parameter selects one of these pools. This partitioning is the cornerstone that guarantees parameter independence: `ffid=1` and `ffid=2` will **never** train the same parameter.
+**1.  Zero Overlap (Partitioning):**
+*   First, all model parameters are deterministically sorted by name to create a consistent global order.
+*   This list is then "dealt" into a fixed number of separate pools, much like dealing cards. The `--ffid` parameter selects one of these pools. This partitioning is the cornerstone that guarantees parameter independence: `ffid=1` and `ffid=2` will **never** train the same parameter.
 
 **2.  Strategic Pool Construction & Selection:**
-After partitioning, the algorithm builds a single, balanced `candidate_pool` for the `ffid` designed to distribute selections evenly. **This replaces the previous two-phase logic with a more elegant single-pass approach.**
+After partitioning, the algorithm builds a single, balanced `candidate_pool` for the `ffid` designed to distribute selections evenly.
 
 *   **Step 1: Group & Rank:** All parameters in the partition are first grouped by their transformer block (0-39). Within each block, they are sorted by importance (e.g., major weights > biases > norms) and then by size.
 *   **Step 2: Interleaved Draft:** The `candidate_pool` is constructed using a round-robin "draft." It takes the #1 ranked parameter from Block 0, then #1 from Block 1, ..., up to Block 39. It then circles back to take the #2 ranked parameter from each block in sequence, and so on.
-*   **Step 3: Fill the Budget:** The algorithm iterates through this perfectly interleaved pool, selecting parameters one by one until the target fraction (`--ff`) is met or slightly exceeded to guarantee meaningful training with at least 1 high-impact matrix.
+*   **Step 3: Fill the Budget:** The algorithm iterates through this interleaved pool, selecting parameters one by one until the target fraction (`--ff`) is met or slightly exceeded to guarantee meaningful training with at least 1 high-impact matrix.
 ---
 
 **Final Selection Properties:**
